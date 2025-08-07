@@ -1,0 +1,118 @@
+default:
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://iam.googleapis.com/${GCP_WORKLOAD_PROVIDER}
+  image:
+    name: hashicorp/terraform:1.9.8
+    entrypoint:
+      - '/usr/bin/env'
+  before_script: |
+    apk update
+    apk add --no-cache python3 curl git
+
+    curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz
+    tar -xf google-cloud-cli-linux-x86_64.tar.gz
+    ./google-cloud-sdk/install.sh --quiet
+    export PATH=$PATH:./google-cloud-sdk/bin
+
+    echo "Authenticating with GCP using Workload Identity Federation..."
+    echo ${GITLAB_OIDC_TOKEN} > .ci_job_jwt_file
+
+    CI_JOB_JWT_FILE=$(readlink -f .ci_job_jwt_file)
+
+    gcloud iam workload-identity-pools create-cred-config $GCP_WORKLOAD_PROVIDER --service-account="${GCP_SERVICE_ACCOUNT_EMAIL}" --output-file=gcp_temp_cred.json --credential-source-file=$CI_JOB_JWT_FILE
+    gcloud config set project $GCP_PROJECT_ID
+    gcloud auth login --cred-file=gcp_temp_cred.json
+    export GOOGLE_APPLICATION_CREDENTIALS=$(readlink -f gcp_temp_cred.json)
+
+    gcloud auth list
+
+    if [ "$CI_COMMIT_BRANCH" = "main" ]; then export DEPLOY_ENV=prod; else export DEPLOY_ENV=dev; fi
+    echo "The deployment environment is ${DEPLOY_ENV}."
+
+variables:
+  GCP_LOCATION: us-west1
+  # Consider the variables already set.
+
+stages:
+
+
+validate:
+  stage: validate
+  script: |
+    cd terraform/envs/$DEPLOY_ENV
+    terraform --version
+    terraform init
+    terraform validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - terraform/**/*
+
+plan:
+  stage: plan
+  script: |
+    apk --no-cache add jq
+    alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+    cd terraform/envs/$DEPLOY_ENV
+    terraform init
+    OLD_IMAGE_URI=$(terraform output -raw agent_image_uri) 
+    terraform plan -out=$PLAN --var "agent_image_uri=$OLD_IMAGE_URI"
+    terraform show --json $PLAN | convert_report > $CI_PROJECT_DIR/$PLAN_JSON
+  artifacts:
+    reports:
+      terraform: $CI_PROJECT_DIR/$PLAN_JSON
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - terraform/**/*
+
+build-image:
+  image: docker:24.0.5
+  stage: build-and-push
+  #  tags:
+  #    - saas-linux-medium-amd64
+  services:
+    - docker:24.0.5-dind
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"
+      changes:
+        - src/**/*
+        - Dockerfile
+        - package.json
+  script: |
+    echo "Authenticating with GCP Artifact Registry..."
+    gcloud auth print-access-token --impersonate-service-account $GCP_SERVICE_ACCOUNT_EMAIL | docker login -u oauth2accesstoken --password-stdin https://$GCP_LOCATION-docker.pkg.dev
+
+    echo "Pulling image from GCP Artifact Registry..."
+    docker pull $GCP_IMAGE_NAME:$CI_COMMIT_BRANCH || true
+    echo "Building image: $GCP_IMAGE_NAME:$GCP_IMAGE_TAG..."
+    docker build --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg GITLAB_AUTH_TOKEN=${GITLAB_AUTH_TOKEN} --cache-from $GCP_IMAGE_NAME:$CI_COMMIT_BRANCH -t $GCP_IMAGE_NAME:$GCP_IMAGE_TAG -t $GCP_IMAGE_NAME:$CI_COMMIT_BRANCH .
+    docker push $GCP_IMAGE_NAME --all-tags
+    echo "Image pushed to GCP Artifact Registry"
+
+    echo $GCP_IMAGE_NAME:$GCP_IMAGE_TAG > agent_image_uri
+
+
+deploy:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"
+  script: |
+    # Determine the image URI
+    if [ -f $CI_PROJECT_DIR/agent_image_uri ]; then
+      AGENT_IMAGE_URI=$(cat $CI_PROJECT_DIR/agent_image_uri)
+      echo "Using new image URI from build-image step: $AGENT_IMAGE_URI"
+    else
+      echo "build-image step did not run. Retrieving old image URI from Terraform output..."
+      cd terraform/envs/$DEPLOY_ENV
+      terraform init
+      AGENT_IMAGE_URI=$(terraform output -raw agent_image_uri)
+      cd $CI_PROJECT_DIR
+      echo "Using existing image URI: $AGENT_IMAGE_URI"
+    fi
+
+    echo "Applying Terraform changes..."
+    cd terraform/envs/$DEPLOY_ENV
+    terraform init
+    terraform apply -auto-approve -var "agent_image_uri=$AGENT_IMAGE_URI"
